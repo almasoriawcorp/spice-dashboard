@@ -8,6 +8,14 @@ from datetime import datetime
 import os
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.inspection import PartialDependenceDisplay
+import shap
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -255,7 +263,7 @@ with st.sidebar:
 
     page = st.selectbox(
         "📊 Navigate",
-        ["Portfolio Overview", "Bissell Thrift Store", "Environmental Impact", "Financial Analysis", "Forecasting & Scenarios", "Weather & ML Insights"],
+        ["Portfolio Overview", "Bissell Thrift Store", "Environmental Impact", "Financial Analysis", "Forecasting & Scenarios", "Weather & ML Insights", "Explainable AI (XAI)"],
         index=0,
     )
 
@@ -1303,6 +1311,496 @@ elif page == "Weather & ML Insights":
         "**Key Insight:** Shortwave radiation, zenith angle, and cloud cover are the strongest "
         "predictors of solar generation. Tree-based models (Random Forest, Gradient Boosting) "
         "typically outperform linear models for this type of non-linear weather-energy relationship."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 7: Explainable AI (XAI)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "Explainable AI (XAI)":
+    st.markdown(
+        """<div class="hero-header">
+            <h1>🧠 Explainable AI (XAI)</h1>
+            <p>Understanding <span class="accent">how and why</span> our models make predictions about solar generation</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    if df_spg is None:
+        st.warning("SPG dataset not found. Please ensure `spg (1) (1).csv` is in the Lab2_EDA folder.")
+        st.stop()
+
+    # ── Prepare data & train models ──────────────────────────────────────────
+    st.markdown("### ⚙️ Model Training")
+    st.markdown(
+        "We train **Random Forest** and **Gradient Boosting** regressors on the SPG dataset "
+        "to predict `generated_power_kw` from weather features, then use XAI techniques to "
+        "explain what drives predictions."
+    )
+
+    # Select features and target
+    feature_cols = [
+        "temperature_2_m_above_gnd", "relative_humidity_2_m_above_gnd",
+        "mean_sea_level_pressure_msl", "total_precipitation_sfc",
+        "snowfall_amount_sfc", "total_cloud_cover_sfc",
+        "high_cloud_cover_high_cld_lay", "medium_cloud_cover_mid_cld_lay",
+        "low_cloud_cover_low_cld_lay", "shortwave_radiation_backwards_sfc",
+        "wind_speed_10_m_above_gnd", "wind_direction_10_m_above_gnd",
+        "wind_speed_80_m_above_gnd", "wind_direction_80_m_above_gnd",
+        "wind_speed_900_mb", "wind_direction_900_mb",
+        "wind_gust_10_m_above_gnd", "angle_of_incidence", "zenith", "azimuth",
+    ]
+
+    # Filter to columns that exist in the dataframe
+    available_features = [c for c in feature_cols if c in df_spg.columns]
+    target_col = "generated_power_kw"
+
+    df_ml = df_spg[available_features + [target_col]].dropna()
+    X = df_ml[available_features]
+    y = df_ml[target_col]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Train models (cached)
+    @st.cache_resource
+    def train_xai_models(_X_train, _y_train):
+        rf = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42, n_jobs=-1)
+        rf.fit(_X_train, _y_train)
+        gb = GradientBoostingRegressor(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42)
+        gb.fit(_X_train, _y_train)
+        return rf, gb
+
+    rf_model, gb_model = train_xai_models(X_train, y_train)
+
+    # Predictions
+    y_pred_rf = rf_model.predict(X_test)
+    y_pred_gb = gb_model.predict(X_test)
+
+    # Metrics
+    metrics_data = {
+        "Model": ["Random Forest", "Gradient Boosting"],
+        "MAE (kW)": [
+            mean_absolute_error(y_test, y_pred_rf),
+            mean_absolute_error(y_test, y_pred_gb),
+        ],
+        "RMSE (kW)": [
+            np.sqrt(mean_squared_error(y_test, y_pred_rf)),
+            np.sqrt(mean_squared_error(y_test, y_pred_gb)),
+        ],
+        "R²": [
+            r2_score(y_test, y_pred_rf),
+            r2_score(y_test, y_pred_gb),
+        ],
+    }
+    metrics_df = pd.DataFrame(metrics_data)
+
+    m1, m2 = st.columns(2)
+    with m1:
+        st.metric("Random Forest R²", f"{metrics_data['R²'][0]:.4f}")
+    with m2:
+        st.metric("Gradient Boosting R²", f"{metrics_data['R²'][1]:.4f}")
+
+    metrics_df["MAE (kW)"] = metrics_df["MAE (kW)"].map("{:.3f}".format)
+    metrics_df["RMSE (kW)"] = metrics_df["RMSE (kW)"].map("{:.3f}".format)
+    metrics_df["R²"] = metrics_df["R²"].map("{:.4f}".format)
+    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── 1. Residual Analysis ─────────────────────────────────────────────────
+    st.markdown("### 📉 Residual Analysis — Actual vs Predicted")
+    st.markdown(
+        "Residual plots show how well the model's predictions match the actual values. "
+        "Points close to the diagonal line indicate accurate predictions."
+    )
+
+    model_choice = st.radio("Select model:", ["Random Forest", "Gradient Boosting"], horizontal=True, key="resid_model")
+    y_pred_selected = y_pred_rf if model_choice == "Random Forest" else y_pred_gb
+
+    col_resid1, col_resid2 = st.columns(2)
+
+    with col_resid1:
+        # Actual vs Predicted scatter
+        fig_avp = go.Figure()
+        fig_avp.add_trace(go.Scatter(
+            x=y_test.values, y=y_pred_selected,
+            mode="markers", marker=dict(color=SPICE_YELLOW, size=4, opacity=0.5),
+            name="Predictions",
+            hovertemplate="Actual: %{x:.2f} kW<br>Predicted: %{y:.2f} kW<extra></extra>",
+        ))
+        # Perfect prediction line
+        max_val = max(y_test.max(), y_pred_selected.max())
+        fig_avp.add_trace(go.Scatter(
+            x=[0, max_val], y=[0, max_val],
+            mode="lines", line=dict(color=SPICE_DARK, width=2, dash="dash"),
+            name="Perfect Prediction",
+        ))
+        fig_avp.update_layout(
+            title="Actual vs Predicted",
+            plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter"),
+            xaxis_title="Actual Power (kW)", yaxis_title="Predicted Power (kW)",
+            margin=dict(t=40, b=20), height=400,
+        )
+        st.plotly_chart(fig_avp, use_container_width=True)
+
+    with col_resid2:
+        # Residual distribution
+        residuals = y_test.values - y_pred_selected
+        fig_resid = go.Figure()
+        fig_resid.add_trace(go.Histogram(
+            x=residuals, nbinsx=50,
+            marker_color=SPICE_ORANGE, opacity=0.8,
+            hovertemplate="Residual: %{x:.2f} kW<br>Count: %{y}<extra></extra>",
+        ))
+        fig_resid.add_vline(x=0, line=dict(color=SPICE_DARK, width=2, dash="dash"))
+        fig_resid.update_layout(
+            title="Residual Distribution",
+            plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter"),
+            xaxis_title="Residual (Actual − Predicted) kW", yaxis_title="Count",
+            margin=dict(t=40, b=20), height=400,
+        )
+        st.plotly_chart(fig_resid, use_container_width=True)
+
+    st.info(
+        f"**Interpretation:** A well-performing model shows points tightly clustered around the diagonal "
+        f"(left) and residuals centered around zero with a narrow spread (right). "
+        f"Mean residual: **{residuals.mean():.3f} kW**, Std: **{residuals.std():.3f} kW**."
+    )
+
+    st.markdown("---")
+
+    # ── 2. Feature Importance ────────────────────────────────────────────────
+    st.markdown("### 📊 Feature Importance (Model-Based)")
+    st.markdown(
+        "Feature importance from tree-based models measures how much each feature contributes "
+        "to reducing prediction error across all decision trees. Unlike simple correlation, "
+        "this captures **non-linear** relationships."
+    )
+
+    col_fi1, col_fi2 = st.columns(2)
+
+    with col_fi1:
+        rf_importance = pd.Series(rf_model.feature_importances_, index=available_features).sort_values()
+        fig_fi_rf = go.Figure()
+        fig_fi_rf.add_trace(go.Bar(
+            x=rf_importance.values,
+            y=[c.replace("_", " ").title()[:35] for c in rf_importance.index],
+            orientation="h",
+            marker_color=[SPICE_GREEN if v > rf_importance.median() else SPICE_YELLOW for v in rf_importance.values],
+        ))
+        fig_fi_rf.update_layout(
+            title="Random Forest — Feature Importance",
+            plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter", size=10),
+            xaxis_title="Importance", margin=dict(t=40, b=20, l=200), height=550,
+        )
+        st.plotly_chart(fig_fi_rf, use_container_width=True)
+
+    with col_fi2:
+        gb_importance = pd.Series(gb_model.feature_importances_, index=available_features).sort_values()
+        fig_fi_gb = go.Figure()
+        fig_fi_gb.add_trace(go.Bar(
+            x=gb_importance.values,
+            y=[c.replace("_", " ").title()[:35] for c in gb_importance.index],
+            orientation="h",
+            marker_color=[SPICE_GREEN if v > gb_importance.median() else SPICE_YELLOW for v in gb_importance.values],
+        ))
+        fig_fi_gb.update_layout(
+            title="Gradient Boosting — Feature Importance",
+            plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter", size=10),
+            xaxis_title="Importance", margin=dict(t=40, b=20, l=200), height=550,
+        )
+        st.plotly_chart(fig_fi_gb, use_container_width=True)
+
+    # Top 3 features for explanation
+    top3_rf = rf_importance.nlargest(3).index.tolist()
+    top3_gb = gb_importance.nlargest(3).index.tolist()
+    st.info(
+        f"**Random Forest top 3:** {', '.join(f.replace('_', ' ').title() for f in top3_rf)}. "
+        f"**Gradient Boosting top 3:** {', '.join(f.replace('_', ' ').title() for f in top3_gb)}. "
+        f"Both models agree that solar radiation and sun position are the dominant predictors."
+    )
+
+    st.markdown("---")
+
+    # ── 3. SHAP Analysis ────────────────────────────────────────────────────
+    st.markdown("### 🔍 SHAP Value Analysis")
+    st.markdown(
+        "**SHAP (SHapley Additive exPlanations)** assigns each feature a contribution value "
+        "for every individual prediction. Positive SHAP values push the prediction higher; "
+        "negative values push it lower. This provides a **per-prediction explanation**."
+    )
+
+    @st.cache_data
+    def compute_shap_values(model_name, _rf_model, _gb_model, _X_sample):
+        model = _rf_model if model_name == "Random Forest" else _gb_model
+        explainer = shap.TreeExplainer(model)
+        sv = explainer(_X_sample)
+        return sv.values, sv.base_values
+
+    # Use a sample for SHAP (faster)
+    shap_sample_size = min(500, len(X_test))
+    X_shap = X_test.iloc[:shap_sample_size]
+
+    shap_model_choice = st.radio("Select model for SHAP:", ["Random Forest", "Gradient Boosting"], horizontal=True, key="shap_model")
+
+    with st.spinner("Computing SHAP values..."):
+        shap_vals, shap_base = compute_shap_values(shap_model_choice, rf_model, gb_model, X_shap)
+
+    # ── SHAP Summary (Beeswarm as Plotly) ──
+    st.markdown("#### SHAP Summary — Feature Impact Overview")
+    st.markdown(
+        "Each dot is one prediction. Horizontal position = SHAP value (impact on prediction). "
+        "Color = feature value (red = high, blue = low)."
+    )
+
+    # Build a Plotly version of the SHAP beeswarm
+    mean_abs_shap = np.abs(shap_vals).mean(axis=0)
+    sorted_idx = np.argsort(mean_abs_shap)
+    sorted_features = [available_features[i] for i in sorted_idx]
+
+    fig_shap_summary = go.Figure()
+    for rank, feat_idx in enumerate(sorted_idx):
+        feat_name = available_features[feat_idx].replace("_", " ").title()[:35]
+        sv = shap_vals[:, feat_idx]
+        fv = X_shap.iloc[:, feat_idx].values
+        # Normalize feature values to [0,1] for color mapping
+        fv_min, fv_max = fv.min(), fv.max()
+        if fv_max > fv_min:
+            fv_norm = (fv - fv_min) / (fv_max - fv_min)
+        else:
+            fv_norm = np.zeros_like(fv)
+        # Add jitter for vertical spread
+        jitter = np.random.default_rng(42).uniform(-0.3, 0.3, size=len(sv))
+        colors = [f"rgb({int(255*v)}, {int(80*(1-v))}, {int(255*(1-v))})" for v in fv_norm]
+        fig_shap_summary.add_trace(go.Scatter(
+            x=sv, y=np.full_like(sv, rank) + jitter,
+            mode="markers", marker=dict(size=3, color=colors, opacity=0.6),
+            name=feat_name, showlegend=False,
+            hovertemplate=f"<b>{feat_name}</b><br>SHAP: %{{x:.3f}}<extra></extra>",
+        ))
+
+    fig_shap_summary.update_layout(
+        plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter", size=10),
+        yaxis=dict(
+            tickvals=list(range(len(sorted_features))),
+            ticktext=[f.replace("_", " ").title()[:35] for f in sorted_features],
+        ),
+        xaxis_title="SHAP Value (impact on prediction)",
+        height=600, margin=dict(t=20, b=30, l=200),
+    )
+    # Add a zero reference line
+    fig_shap_summary.add_vline(x=0, line=dict(color="gray", width=1, dash="dot"))
+    st.plotly_chart(fig_shap_summary, use_container_width=True)
+    st.caption("🔴 Red = high feature value, 🔵 Blue = low feature value")
+
+    st.markdown("---")
+
+    # ── SHAP Bar Plot (Mean Absolute SHAP) ──
+    st.markdown("#### SHAP Bar Plot — Mean Absolute Impact")
+    st.markdown("Average magnitude of SHAP values per feature — shows overall importance regardless of direction.")
+
+    shap_importance = pd.Series(mean_abs_shap, index=available_features).sort_values()
+    fig_shap_bar = go.Figure()
+    fig_shap_bar.add_trace(go.Bar(
+        x=shap_importance.values,
+        y=[c.replace("_", " ").title()[:35] for c in shap_importance.index],
+        orientation="h",
+        marker_color=SPICE_ORANGE,
+    ))
+    fig_shap_bar.update_layout(
+        plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter", size=10),
+        xaxis_title="Mean |SHAP Value|", margin=dict(t=20, b=20, l=200), height=550,
+    )
+    st.plotly_chart(fig_shap_bar, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── SHAP Waterfall for Individual Prediction ──
+    st.markdown("#### 🔬 SHAP Waterfall — Explaining a Single Prediction")
+    st.markdown(
+        "Select a specific data point to see how each feature pushed the prediction "
+        "higher or lower from the base value (average prediction)."
+    )
+
+    sample_idx = st.slider("Select test sample index:", 0, shap_sample_size - 1, 0)
+    sv_single = shap_vals[sample_idx]
+    base_value = shap_base[sample_idx] if np.ndim(shap_base) > 0 else shap_base
+    actual_pred = base_value + sv_single.sum()
+
+    # Sort by absolute SHAP value, show top 10
+    top_n = 10
+    abs_sv = np.abs(sv_single)
+    top_indices = abs_sv.argsort()[-top_n:][::-1]
+
+    waterfall_features = [available_features[i].replace("_", " ").title()[:30] for i in top_indices]
+    waterfall_values = [sv_single[i] for i in top_indices]
+    waterfall_feat_vals = [X_shap.iloc[sample_idx, i] for i in top_indices]
+
+    # Build waterfall-style horizontal bar chart
+    colors_wf = [SPICE_GREEN if v > 0 else SPICE_ORANGE for v in waterfall_values]
+    labels_wf = [f"{fn} = {fv:.1f}" for fn, fv in zip(waterfall_features, waterfall_feat_vals)]
+
+    fig_waterfall = go.Figure()
+    fig_waterfall.add_trace(go.Bar(
+        y=labels_wf[::-1], x=waterfall_values[::-1], orientation="h",
+        marker_color=colors_wf[::-1],
+        text=[f"{v:+.3f}" for v in waterfall_values[::-1]],
+        textposition="outside",
+    ))
+    fig_waterfall.update_layout(
+        title=f"Sample #{sample_idx} — Predicted: {actual_pred:.2f} kW | Actual: {y_test.iloc[sample_idx]:.2f} kW | Base: {base_value:.2f} kW",
+        plot_bgcolor="white", paper_bgcolor="white", font=dict(family="Inter", size=10),
+        xaxis_title="SHAP Value (contribution to prediction)",
+        margin=dict(t=60, b=20, l=250), height=420,
+    )
+    fig_waterfall.add_vline(x=0, line=dict(color="gray", width=1, dash="dot"))
+    st.plotly_chart(fig_waterfall, use_container_width=True)
+
+    st.info(
+        f"**Reading this chart:** The base value ({base_value:.2f} kW) is the average model prediction. "
+        f"Green bars push the prediction **up**, orange bars push it **down**. "
+        f"The final prediction is the base value plus all SHAP contributions: **{actual_pred:.2f} kW**."
+    )
+
+    st.markdown("---")
+
+    # ── 4. Partial Dependence Plots ──────────────────────────────────────────
+    st.markdown("### 📈 Partial Dependence Plots (PDPs)")
+    st.markdown(
+        "PDPs show the **marginal effect** of a single feature on the predicted outcome, "
+        "averaging over all other features. They reveal the shape of the relationship "
+        "between a feature and the prediction."
+    )
+
+    # Top 4 features by importance for PDP
+    top4_features = rf_importance.nlargest(4).index.tolist()
+
+    pdp_col1, pdp_col2 = st.columns(2)
+    pdp_cols = [pdp_col1, pdp_col2, pdp_col1, pdp_col2]
+
+    for i, feat in enumerate(top4_features):
+        with pdp_cols[i]:
+            feat_idx_in_X = available_features.index(feat)
+            # Compute partial dependence manually for Plotly
+            grid_values = np.linspace(X_train[feat].quantile(0.05), X_train[feat].quantile(0.95), 50)
+            pd_values = []
+            X_temp = X_train.sample(min(300, len(X_train)), random_state=42).copy()
+            for val in grid_values:
+                X_temp[feat] = val
+                pd_values.append(rf_model.predict(X_temp).mean())
+
+            fig_pdp = go.Figure()
+            fig_pdp.add_trace(go.Scatter(
+                x=grid_values, y=pd_values,
+                line=dict(color=SPICE_DARK, width=3),
+                fill="tozeroy", fillcolor="rgba(242,169,0,0.15)",
+                hovertemplate=f"<b>{feat.replace('_',' ').title()}</b>: %{{x:.1f}}<br>Predicted Power: %{{y:.2f}} kW<extra></extra>",
+            ))
+            fig_pdp.update_layout(
+                title=feat.replace("_", " ").title()[:30],
+                plot_bgcolor="white", paper_bgcolor="white",
+                font=dict(family="Inter", size=10),
+                xaxis_title=feat.replace("_", " ").title()[:30],
+                yaxis_title="Predicted Power (kW)",
+                height=320, margin=dict(t=40, b=30),
+            )
+            st.plotly_chart(fig_pdp, use_container_width=True)
+
+    st.info(
+        "**Interpretation:** PDPs show the average model prediction as a feature varies while "
+        "all other features are held at their observed values. A steep curve means the feature "
+        "has a strong effect; a flat curve means little effect. "
+        "These plots help SPICE understand, for example, how much shortwave radiation is needed "
+        "before solar generation ramps up significantly."
+    )
+
+    st.markdown("---")
+
+    # ── 5. Time Series XAI — Forecast Decomposition & Intervals ──────────────
+    st.markdown("### ⏱️ Time Series Explainability")
+    st.markdown(
+        "For the Holt-Winters forecast on Page 5, we already provide two key XAI techniques:"
+    )
+
+    ts_col1, ts_col2 = st.columns(2)
+    with ts_col1:
+        st.markdown(
+            """<div class="info-card">
+                <h4>📊 Seasonal Decomposition</h4>
+                <p>Breaks the Bissell daily production into <strong>trend</strong> (long-term direction),
+                <strong>seasonal</strong> (weekly cycle), and <strong>residual</strong> (random noise) components.
+                This makes the model's behaviour transparent — the trend shows Edmonton's seasonal solar decline,
+                the seasonal component captures weekly weather patterns, and residuals represent
+                unpredictable day-to-day variation.</p>
+                <p><strong>→ See Page 5: Seasonal Decomposition</strong></p>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    with ts_col2:
+        st.markdown(
+            """<div class="info-card">
+                <h4>🔮 Prediction Intervals</h4>
+                <p>The 30-day Holt-Winters forecast includes <strong>80% and 95% confidence intervals</strong>
+                calculated from the model's residual standard deviation. These intervals communicate
+                <strong>uncertainty</strong> — telling SPICE not just "we predict X kWh" but "we're 95%
+                confident production will fall between Y and Z kWh." This is critical for financial
+                planning and setting realistic expectations.</p>
+                <p><strong>→ See Page 5: 30-Day Production Forecast</strong></p>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    st.markdown("### 📋 XAI Techniques Summary")
+
+    xai_summary = pd.DataFrame({
+        "Technique": [
+            "Residual Analysis",
+            "Feature Importance",
+            "SHAP Values (Summary)",
+            "SHAP Waterfall (Individual)",
+            "Partial Dependence Plots",
+            "Seasonal Decomposition",
+            "Prediction Intervals",
+        ],
+        "Model Type": [
+            "Random Forest / Gradient Boosting",
+            "Random Forest / Gradient Boosting",
+            "Random Forest / Gradient Boosting",
+            "Random Forest / Gradient Boosting",
+            "Random Forest",
+            "Holt-Winters (Time Series)",
+            "Holt-Winters (Time Series)",
+        ],
+        "What It Explains": [
+            "How accurate the model is — where it succeeds and fails",
+            "Which weather features matter most overall",
+            "How each feature pushes predictions up or down across all samples",
+            "Why the model made a specific prediction for one data point",
+            "The shape of the relationship between a feature and the prediction",
+            "Trend, seasonality, and noise in Bissell production data",
+            "Uncertainty range around forecasted values",
+        ],
+        "Location": [
+            "This page",
+            "This page",
+            "This page",
+            "This page",
+            "This page",
+            "Page 5 — Forecasting & Scenarios",
+            "Page 5 — Forecasting & Scenarios",
+        ],
+    })
+    st.dataframe(xai_summary, use_container_width=True, hide_index=True)
+
+    st.success(
+        "**Why XAI matters for SPICE:** These techniques help stakeholders understand that our predictions "
+        "are not black boxes. Investors can see *which weather factors* drive solar output, community partners "
+        "can understand *how confident* we are in forecasts, and SPICE can make *data-driven decisions* about "
+        "future project sites by understanding the relationship between weather conditions and generation."
     )
 
 
