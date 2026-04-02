@@ -13,6 +13,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.inspection import PartialDependenceDisplay
 import shap
+from sentence_transformers import SentenceTransformer, util
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -263,7 +264,7 @@ with st.sidebar:
 
     page = st.selectbox(
         "📊 Navigate",
-        ["Portfolio Overview", "Bissell Thrift Store", "Environmental Impact", "Financial Analysis", "Forecasting & Scenarios", "Weather & ML Insights", "Explainable AI (XAI)"],
+        ["Portfolio Overview", "Bissell Thrift Store", "Environmental Impact", "Financial Analysis", "Forecasting & Scenarios", "Weather & ML Insights", "Explainable AI (XAI)", "SPICE Assistant"],
         index=0,
     )
 
@@ -1801,6 +1802,240 @@ elif page == "Explainable AI (XAI)":
         "are not black boxes. Investors can see *which weather factors* drive solar output, community partners "
         "can understand *how confident* we are in forecasts, and SPICE can make *data-driven decisions* about "
         "future project sites by understanding the relationship between weather conditions and generation."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 8: SPICE Assistant (RAG Retrieval)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "SPICE Assistant":
+    st.markdown(
+        """<div class="hero-header">
+            <h1>💬 SPICE Assistant</h1>
+            <p>Ask questions about SPICE projects, solar production, and environmental impact — powered by <span class="accent">semantic retrieval</span></p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── Build SPICE Knowledge Base ────────────────────────────────────────────
+    # Dynamically generate knowledge documents from the loaded data
+    kb_documents = {}
+
+    # 1. SPICE overview
+    kb_documents["spice_overview"] = (
+        "SPICE (Solar Power Investment Cooperative of Edmonton) is a community-owned "
+        "renewable energy investment cooperative founded in 2015. It has approximately 100 members "
+        "and is run by a volunteer board with one part-time paid contractor (Annette Dautel, "
+        "business development). Members invest in local solar projects installed on community "
+        "buildings in Edmonton, Alberta. SPICE's mission is to make solar energy accessible "
+        "through community investment and to demonstrate the viability of cooperative renewable "
+        "energy models. Website: joinspice.ca"
+    )
+
+    # 2. Project portfolio
+    portfolio_text = "SPICE has completed 4 solar projects with a combined capacity of {:.1f} kWp:\n".format(TOTAL_CAPACITY_KWP)
+    for name, info in SPICE_PROJECTS.items():
+        portfolio_text += (
+            f"- {name}: {info['capacity_kwp']} kWp system at {info['location']}, "
+            f"completed {info['completed']}. Type: {info['type']}. Status: {info['status']}."
+        )
+        if info.get("inverter_model"):
+            portfolio_text += f" Inverters: {info['inverters']}x {info['inverter_model']}."
+        portfolio_text += "\n"
+    kb_documents["project_portfolio"] = portfolio_text
+
+    # 3. Bissell production summary (dynamic from data)
+    if df_bissell is not None:
+        total_kwh = df_bissell["total_system_kwh"].sum()
+        peak_row = df_bissell.loc[df_bissell["total_system_kwh"].idxmax()]
+        producing_days = (df_bissell["total_system_kwh"] > 0.5).sum()
+        avg_daily = df_bissell.loc[df_bissell["total_system_kwh"] > 0.5, "total_system_kwh"].mean()
+        date_range = f"{df_bissell['date'].min().strftime('%B %d, %Y')} to {df_bissell['date'].max().strftime('%B %d, %Y')}"
+
+        kb_documents["bissell_production"] = (
+            f"Bissell Thrift Store (118 Avenue, Edmonton) solar production data covers {date_range}. "
+            f"The 30 kWp system has 3 Fronius Primo 7.6-1 208-240 inverters. "
+            f"Total energy generated: {total_kwh:,.1f} kWh over {len(df_bissell)} days. "
+            f"Peak daily production: {peak_row['total_system_kwh']:.1f} kWh on {peak_row['date'].strftime('%B %d, %Y')}. "
+            f"Days with meaningful production (>0.5 kWh): {producing_days}. "
+            f"Average daily output on producing days: {avg_daily:.1f} kWh."
+        )
+
+        # 4. Monthly breakdown
+        monthly = df_bissell.groupby("month_name")["total_system_kwh"].agg(["sum", "mean", "max", "count"])
+        monthly_text = "Monthly production breakdown for Bissell Thrift Store:\n"
+        for month_name, row in monthly.iterrows():
+            monthly_text += (
+                f"- {month_name}: {row['sum']:,.1f} kWh total, {row['mean']:.1f} kWh avg/day, "
+                f"{row['max']:.1f} kWh peak day, {int(row['count'])} days of data.\n"
+            )
+        kb_documents["bissell_monthly"] = monthly_text
+
+        # 5. Inverter performance
+        inv1_total = df_bissell["inverter_1_kwh"].sum()
+        inv2_total = df_bissell["inverter_2_kwh"].sum()
+        inv3_total = df_bissell["inverter_3_kwh"].sum()
+        kb_documents["inverter_performance"] = (
+            f"Bissell Thrift Store has 3 Fronius Primo 7.6-1 inverters. "
+            f"Inverter 1 produced {inv1_total:,.1f} kWh, Inverter 2 produced {inv2_total:,.1f} kWh, "
+            f"Inverter 3 produced {inv3_total:,.1f} kWh. Total system: {total_kwh:,.1f} kWh. "
+            f"Each inverter is rated at 7.6 kW (connected to ~10 kWp of panels)."
+        )
+
+    # 6. Environmental impact
+    if df_bissell is not None:
+        co2 = calculate_co2_avoided(total_kwh)
+        trees = co2_to_trees(co2)
+        cars = co2_to_cars(co2)
+        kb_documents["environmental_impact"] = (
+            f"Environmental impact of Bissell Thrift Store solar system (Aug-Dec 2025): "
+            f"{total_kwh:,.0f} kWh of clean energy generated, {co2:,.2f} tonnes of CO2 avoided, "
+            f"equivalent to planting {trees:,.0f} trees or taking {cars:,.2f} cars off the road for a year. "
+            f"Alberta grid emission factor: {ALBERTA_EMISSION_FACTOR} tonnes CO2e per MWh. "
+            f"Projected annual impact for the full {TOTAL_CAPACITY_KWP:.1f} kWp portfolio: "
+            f"{TOTAL_CAPACITY_KWP * 1100:,.0f} kWh/year, "
+            f"{calculate_co2_avoided(TOTAL_CAPACITY_KWP * 1100):,.1f} tonnes CO2 avoided/year."
+        )
+
+    # 7. Financial information
+    kb_documents["financial_info"] = (
+        f"Financial analysis for SPICE solar projects: "
+        f"Alberta electricity rate is approximately ${ALBERTA_ELECTRICITY_RATE}/kWh (regulated rate). "
+        f"Micro-generation credit rate is approximately $0.12/kWh. "
+        f"AESO wholesale pool price averages around $0.108/kWh. "
+        f"Bissell Thrift Store estimated annual production: {30 * 1100:,.0f} kWh/year "
+        f"(30 kWp at Edmonton average yield of 1,100 kWh/kWp/year). "
+        f"Estimated annual savings at regulated rate: ${30 * 1100 * ALBERTA_ELECTRICITY_RATE:,.0f} CAD. "
+        f"Full portfolio ({TOTAL_CAPACITY_KWP:.1f} kWp) estimated annual production: "
+        f"{TOTAL_CAPACITY_KWP * 1100:,.0f} kWh/year. "
+        f"Solar panels typically last 25+ years with gradual degradation."
+    )
+
+    # 8. Edmonton solar context
+    kb_documents["edmonton_solar"] = (
+        "Edmonton, Alberta solar resource: Average annual solar yield is approximately 1,100 kWh/kWp/year. "
+        "Peak solar months are May-July with daily irradiance of 5.5-5.8 kWh/m2/day and 15-17 hours of daylight. "
+        "Winter months (Nov-Jan) see 0.9-1.2 kWh/m2/day irradiance and 7.5-8.7 hours of daylight. "
+        "Bissell data covers Aug-Dec, capturing the transition from peak to low production. "
+        "Summer months contribute roughly 60-70% of annual production. "
+        "Cloud cover, snow, and short daylight hours significantly reduce winter output."
+    )
+
+    # 9. ML and forecasting info
+    kb_documents["ml_forecasting"] = (
+        "Machine learning models used in the SPICE dashboard: "
+        "Random Forest and Gradient Boosting regressors predict solar generation from weather features "
+        "(trained on SPG dataset with 4,213 records). "
+        "Key predictive features: shortwave radiation, zenith angle, cloud cover, and temperature. "
+        "Holt-Winters exponential smoothing is used for 30-day production forecasting with "
+        "80% and 95% confidence intervals. "
+        "XAI techniques include SHAP values, feature importance, partial dependence plots, "
+        "and residual analysis. Tree-based models outperform linear models for solar prediction."
+    )
+
+    # ── Embed Knowledge Base ──────────────────────────────────────────────────
+    @st.cache_resource
+    def load_embedder():
+        return SentenceTransformer("all-MiniLM-L6-v2")
+
+    @st.cache_data
+    def embed_documents(_embedder, doc_texts, doc_ids):
+        embeddings = _embedder.encode(doc_texts, convert_to_tensor=True)
+        return embeddings
+
+    embedder = load_embedder()
+    doc_ids = list(kb_documents.keys())
+    doc_texts = list(kb_documents.values())
+    doc_embeddings = embed_documents(embedder, doc_texts, doc_ids)
+
+    def retrieve(query, top_k=3):
+        """Retrieve the top_k most relevant knowledge base documents."""
+        query_emb = embedder.encode(query, convert_to_tensor=True)
+        scores = util.pytorch_cos_sim(query_emb, doc_embeddings)[0]
+        top_indices = scores.argsort(descending=True)[:top_k]
+        results = []
+        for idx in top_indices:
+            results.append({
+                "doc_id": doc_ids[idx],
+                "text": doc_texts[idx],
+                "score": scores[idx].item(),
+            })
+        return results
+
+    # ── Chat Interface ────────────────────────────────────────────────────────
+    st.markdown("### 💡 Ask About SPICE")
+    st.markdown(
+        "Type a question below and the assistant will find the most relevant information "
+        "from the SPICE knowledge base. Try questions like:"
+    )
+    st.markdown(
+        "- *How much energy has Bissell produced?*\n"
+        "- *What is SPICE's environmental impact?*\n"
+        "- *How many solar projects does SPICE have?*\n"
+        "- *What are the financial savings?*\n"
+        "- *What weather factors affect solar generation?*"
+    )
+
+    st.markdown("---")
+
+    # Initialize chat history
+    if "rag_messages" not in st.session_state:
+        st.session_state.rag_messages = []
+
+    # Display chat history
+    for msg in st.session_state.rag_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat input
+    if user_query := st.chat_input("Ask about SPICE projects, production, impact..."):
+        # Show user message
+        st.session_state.rag_messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        # Retrieve relevant documents
+        results = retrieve(user_query, top_k=3)
+
+        # Build response
+        response_parts = []
+        response_parts.append("Here's what I found:\n")
+
+        for i, result in enumerate(results):
+            if result["score"] < 0.15:
+                continue
+            doc_title = result["doc_id"].replace("_", " ").title()
+            response_parts.append(f"**{doc_title}** *(relevance: {result['score']:.0%})*\n")
+            response_parts.append(f"{result['text']}\n")
+            if i < len(results) - 1:
+                response_parts.append("---\n")
+
+        if len(response_parts) <= 1:
+            response_parts.append(
+                "I couldn't find a strong match for that question in the SPICE knowledge base. "
+                "Try rephrasing or asking about projects, production, environment, or finances."
+            )
+
+        full_response = "\n".join(response_parts)
+
+        # Show assistant response
+        with st.chat_message("assistant"):
+            st.markdown(full_response)
+        st.session_state.rag_messages.append({"role": "assistant", "content": full_response})
+
+    # ── Knowledge Base Overview ───────────────────────────────────────────────
+    with st.expander("📚 View Knowledge Base Contents"):
+        st.markdown(f"**{len(kb_documents)} documents** indexed for retrieval:")
+        for doc_id, text in kb_documents.items():
+            title = doc_id.replace("_", " ").title()
+            st.markdown(f"**{title}**")
+            st.caption(text[:200] + "..." if len(text) > 200 else text)
+            st.markdown("")
+
+    st.info(
+        "**How it works:** This assistant uses semantic search (sentence-transformers) to find "
+        "the most relevant information from SPICE's knowledge base. It retrieves actual data and facts "
+        "rather than generating text, ensuring all answers are accurate and grounded in real data."
     )
 
 
